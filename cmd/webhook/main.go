@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 	"time"
 
 	policyduckv1beta1 "github.com/sigstore/policy-controller/pkg/apis/duck/v1beta1"
@@ -103,6 +104,10 @@ var (
 	// trustrootResyncPeriod holds the interval which the TrustRoot will resync
 	// This is essential for triggering a reconcile update for potentially stale TUF metadata.
 	trustrootResyncPeriod = flag.Duration("trustroot-resync-period", 24*time.Hour, "The resync period for ClusterImagePolicies. The default is 24h.")
+
+	// resourceNames holds the comma-separated list of Kubernetes resources to monitor.
+	// https://github.com/sigstore/policy-controller/issues/1388
+	resourceNames = flag.String("resource-names", "pods,replicasets,deployments,statefulsets,daemonsets,jobs,cronjobs", "Comma-separated list of Kubernetes resources to monitor. WARNING: If parent resources (e.g., Deployments, ReplicaSets) are not monitored, users will not receive policy violation feedback when creating them, even though the Pods they create may violate policies.")
 )
 
 func main() {
@@ -117,6 +122,25 @@ func main() {
 	flag.IntVar(&opts.Port, "secure-port", opts.Port, "The port on which to serve HTTPS.")
 
 	flag.Parse()
+
+	// Parse and validate resource names
+	resourceList := parseResourceNames(*resourceNames)
+	types = buildTypesMap(ctx, resourceList)
+
+	// Check if user has customized the resource list
+	defaultResources := "pods,replicasets,deployments,statefulsets,daemonsets,jobs,cronjobs"
+	if *resourceNames != defaultResources {
+		logging.FromContext(ctx).Warnf("WARNING: Using custom resource names may result in poor user experience. "+
+			"If parent resources (e.g., Deployments, ReplicaSets) are not monitored, users will not receive policy violation feedback "+
+			"when creating those resources, even though the Pods they create may violate policies. "+
+			"It is recommended to monitor all resource types unless you have a specific reason to exclude some. "+
+			"Current monitored resources: %v", resourceList)
+	} else {
+		logging.FromContext(ctx).Infof("Monitoring resources: %v", resourceList)
+	}
+
+	// Update ValidResourceNames to match the configured resources
+	common.ValidResourceNames = sets.NewString(resourceList...)
 
 	// If TUF has been disabled do not try to set it up.
 	if !*disableTUF {
@@ -138,11 +162,6 @@ func main() {
 	// Set the policy and trust root resync periods
 	ctx = clusterimagepolicy.ToContext(ctx, *policyResyncPeriod)
 	ctx = pctuf.ToContext(ctx, *trustrootResyncPeriod)
-
-	// This must match the set of resources we configure in
-	// cmd/webhook/main.go in the "types" map.
-	common.ValidResourceNames = sets.NewString("replicasets", "deployments",
-		"pods", "cronjobs", "jobs", "statefulsets", "daemonsets")
 
 	v := version.GetVersionInfo()
 	vJSON, _ := v.JSONString()
@@ -199,17 +218,71 @@ func (c *crdEphemeralContainers) SupportedVerbs() []admissionregistrationv1.Oper
 	}
 }
 
-var types = map[schema.GroupVersionKind]resourcesemantics.GenericCRD{
-	corev1.SchemeGroupVersion.WithKind("Pod"): &crdEphemeralContainers{GenericCRD: &duckv1.Pod{}},
+// types holds the mapping of Kubernetes resource types to their CRD handlers.
+// This is initialized in main() based on the --resource-names flag.
+var types map[schema.GroupVersionKind]resourcesemantics.GenericCRD
 
-	appsv1.SchemeGroupVersion.WithKind("ReplicaSet"):  &crdNoStatusUpdatesOrDeletes{GenericCRD: &policyduckv1beta1.PodScalable{}},
-	appsv1.SchemeGroupVersion.WithKind("Deployment"):  &crdNoStatusUpdatesOrDeletes{GenericCRD: &policyduckv1beta1.PodScalable{}},
-	appsv1.SchemeGroupVersion.WithKind("StatefulSet"): &crdNoStatusUpdatesOrDeletes{GenericCRD: &policyduckv1beta1.PodScalable{}},
-	appsv1.SchemeGroupVersion.WithKind("DaemonSet"):   &crdNoStatusUpdatesOrDeletes{GenericCRD: &duckv1.WithPod{}},
-	batchv1.SchemeGroupVersion.WithKind("Job"):        &crdNoStatusUpdatesOrDeletes{GenericCRD: &duckv1.WithPod{}},
+// parseResourceNames parses a comma-separated list of resource names and returns a cleaned slice.
+func parseResourceNames(input string) []string {
+	parts := strings.Split(input, ",")
+	result := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(strings.ToLower(part))
+		if trimmed != "" {
+			result = append(result, trimmed)
+		}
+	}
+	return result
+}
 
-	batchv1.SchemeGroupVersion.WithKind("CronJob"):      &crdNoStatusUpdatesOrDeletes{GenericCRD: &duckv1.CronJob{}},
-	batchv1beta1.SchemeGroupVersion.WithKind("CronJob"): &crdNoStatusUpdatesOrDeletes{GenericCRD: &duckv1.CronJob{}},
+// buildTypesMap constructs the types map based on the provided resource names.
+// Resource names must be in lowercase plural form (e.g., "pods", "deployments").
+func buildTypesMap(ctx context.Context, resourceNames []string) map[schema.GroupVersionKind]resourcesemantics.GenericCRD {
+	logger := logging.FromContext(ctx)
+	typesMap := make(map[schema.GroupVersionKind]resourcesemantics.GenericCRD)
+	validResources := []string{}
+	invalidResources := []string{}
+
+	for _, name := range resourceNames {
+		switch name {
+		case "pods":
+			typesMap[corev1.SchemeGroupVersion.WithKind("Pod")] = &crdEphemeralContainers{GenericCRD: &duckv1.Pod{}}
+			validResources = append(validResources, name)
+		case "replicasets":
+			typesMap[appsv1.SchemeGroupVersion.WithKind("ReplicaSet")] = &crdNoStatusUpdatesOrDeletes{GenericCRD: &policyduckv1beta1.PodScalable{}}
+			validResources = append(validResources, name)
+		case "deployments":
+			typesMap[appsv1.SchemeGroupVersion.WithKind("Deployment")] = &crdNoStatusUpdatesOrDeletes{GenericCRD: &policyduckv1beta1.PodScalable{}}
+			validResources = append(validResources, name)
+		case "statefulsets":
+			typesMap[appsv1.SchemeGroupVersion.WithKind("StatefulSet")] = &crdNoStatusUpdatesOrDeletes{GenericCRD: &policyduckv1beta1.PodScalable{}}
+			validResources = append(validResources, name)
+		case "daemonsets":
+			typesMap[appsv1.SchemeGroupVersion.WithKind("DaemonSet")] = &crdNoStatusUpdatesOrDeletes{GenericCRD: &duckv1.WithPod{}}
+			validResources = append(validResources, name)
+		case "jobs":
+			typesMap[batchv1.SchemeGroupVersion.WithKind("Job")] = &crdNoStatusUpdatesOrDeletes{GenericCRD: &duckv1.WithPod{}}
+			validResources = append(validResources, name)
+		case "cronjobs":
+			typesMap[batchv1.SchemeGroupVersion.WithKind("CronJob")] = &crdNoStatusUpdatesOrDeletes{GenericCRD: &duckv1.CronJob{}}
+			typesMap[batchv1beta1.SchemeGroupVersion.WithKind("CronJob")] = &crdNoStatusUpdatesOrDeletes{GenericCRD: &duckv1.CronJob{}}
+			validResources = append(validResources, name)
+		default:
+			invalidResources = append(invalidResources, name)
+		}
+	}
+
+	if len(invalidResources) > 0 {
+		logger.Warnf("Invalid resource names will be ignored: %v. Valid options are: pods, replicasets, deployments, statefulsets, daemonsets, jobs, cronjobs", invalidResources)
+	}
+
+	if len(validResources) == 0 {
+		logger.Fatalf("No valid resources specified. At least one resource type must be monitored. Valid options are: pods, replicasets, deployments, statefulsets, daemonsets, jobs, cronjobs")
+	}
+
+	logger.Infof("Configured to monitor %d resource type(s): %v", len(validResources), validResources)
+
+	return typesMap
 }
 
 var typesCIP = map[schema.GroupVersionKind]resourcesemantics.GenericCRD{
