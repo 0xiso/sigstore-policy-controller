@@ -120,8 +120,47 @@ sed -i'' -e "s@ROOT_JSON@${ROOT_JSON}@g" ./test/testdata/trustroot/e2e/with-repo
 sed -i'' -e "s@REPOSITORY@${REPOSITORY}@g" ./test/testdata/trustroot/e2e/with-repository.yaml
 kubectl apply -f ./test/testdata/trustroot/e2e/with-repository.yaml
 
-# allow things to propagate
-sleep 5
+# Wait for TrustRoot to be available in the webhook's cache
+# We do this by checking if the webhook can actually access the TrustRoot
+# by attempting to create a job and checking if we get the expected error
+# (not the "trustRootRef not found" error)
+echo "Waiting for TrustRoot to be available in webhook cache..."
+MAX_RETRIES=60
+RETRY_COUNT=0
+TRUSTROOT_READY=false
+
+while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+  KUBECTL_TEST_FILE="/tmp/kubectl.trustroot.test.out"
+  kubectl delete job demo -n ${NS} --ignore-not-found=true > /dev/null 2>&1
+  kubectl create -n ${NS} job demo --image=${demoimage} 2> ${KUBECTL_TEST_FILE} || true
+
+  if grep -q "trustRootRef.*not found" ${KUBECTL_TEST_FILE}; then
+    if [ $((RETRY_COUNT % 10)) -eq 0 ]; then
+      echo "TrustRoot not yet available in webhook cache (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
+      echo "Current error: $(grep 'trustRootRef.*not found' ${KUBECTL_TEST_FILE})"
+    fi
+    sleep 2
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+  else
+    echo "TrustRoot is now available in webhook cache after $((RETRY_COUNT + 1)) attempts"
+    TRUSTROOT_READY=true
+    break
+  fi
+done
+
+if [ "$TRUSTROOT_READY" = false ]; then
+  echo "ERROR: TrustRoot did not become available in webhook cache after $((MAX_RETRIES * 2)) seconds"
+  echo "Last error was:"
+  cat ${KUBECTL_TEST_FILE}
+  echo ""
+  echo "Checking if TrustRoot resource exists:"
+  kubectl get trustroot -A
+  echo ""
+  echo "Checking webhook pod logs:"
+  kubectl logs -n cosign-system deployment/webhook --tail=50
+  exit 1
+fi
+
 echo '::endgroup::'
 
 # This image has no attestation, so should fail
